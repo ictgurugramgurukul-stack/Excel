@@ -105,7 +105,11 @@ router.get('/history', async (req, res) => {
   const { member_id, limit } = req.query;
   let query = supabase
     .from('points_transactions')
-    .select('*')
+    // Embed the linked student row via the student_id foreign key so the
+    // response includes the student's name/class/room/house, not just
+    // their member_id. Without this join, history rows have no student
+    // info attached at all.
+    .select('*, students(name, class, room, house)')
     .order('created_at', { ascending: false })
     .limit(Math.min(Number(limit) || 100, 500));
 
@@ -113,7 +117,21 @@ router.get('/history', async (req, res) => {
 
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
-  return res.json({ transactions: data });
+
+  // Flatten the embedded "students" object onto each transaction so the
+  // frontend doesn't need to know about the join shape.
+  const transactions = (data || []).map((row) => {
+    const { students: student, ...txn } = row;
+    return {
+      ...txn,
+      student_name: student ? student.name : null,
+      class: student ? student.class : null,
+      room: student ? student.room : null,
+      house: student ? student.house : null,
+    };
+  });
+
+  return res.json({ transactions });
 });
 
 module.exports = router;
