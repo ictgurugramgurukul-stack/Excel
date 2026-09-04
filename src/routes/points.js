@@ -70,15 +70,19 @@ router.post('/', requireExcelApiKey, async (req, res) => {
   });
 });
 
-// GET /api/points/history/:member_id
-// Recent point transactions for one student, most recent first.
-// Used by the website's student detail view.
-router.get('/history/:member_id', requireExcelApiKey, async (req, res) => {
-  const memberId = String(req.params.member_id || '').trim();
+// Shared handler for both history route styles below.
+async function getHistory(req, res) {
+  // Accepts member_id either as a path segment (/history/G003) or as a
+  // query string (/history?member_id=G003) — some callers (e.g. a
+  // browser address bar, or a frontend using ?member_id=) use the
+  // query-string form, and previously ONLY the path form was routed,
+  // which is why /api/points/history?member_id=G003 returned
+  // "Cannot GET /api/points/history" (no matching route at all).
+  const memberId = String(req.params.member_id || req.query.member_id || '').trim();
   const limit = Math.min(Number(req.query.limit) || 50, 200);
 
   if (!memberId) {
-    return res.status(400).json({ error: 'member_id is required.' });
+    return res.status(400).json({ error: 'member_id is required (as ?member_id=... or /history/MEMBER_ID).' });
   }
 
   const { data, error } = await supabase
@@ -90,6 +94,13 @@ router.get('/history/:member_id', requireExcelApiKey, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ member_id: memberId, history: data });
-});
+}
+
+// GET /api/points/history?member_id=G003
+// GET /api/points/history/G003
+// Recent point transactions for one student, most recent first.
+// Used by the website's student detail view. Both call styles work.
+router.get('/history', requireExcelApiKey, getHistory);
+router.get('/history/:member_id', requireExcelApiKey, getHistory);
 
 module.exports = router;
