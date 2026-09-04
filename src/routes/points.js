@@ -1,14 +1,15 @@
 const express = require('express');
 const supabase = require('../supabaseClient');
 const { requireExcelApiKey } = require('../middleware/auth');
+const { findActivity } = require('../activities');
 
 const router = express.Router();
 
 // A simple in-memory guard against accidental double-submits from a
-// double-click: if the exact same (member_id, points, reason, teacher)
-// arrives again within a few seconds, it's rejected as a duplicate.
-// This is a best-effort safety net on top of the Excel-side button
-// lock (see the VBA code) — it does not replace it.
+// double-click: if the exact same (member_id, activity, teacher) arrives
+// again within a few seconds, it's rejected as a duplicate. This is a
+// best-effort safety net on top of the Excel-side button lock (see the
+// VBA code) — it does not replace it.
 const recentSubmissions = new Map(); // key -> timestamp (ms)
 const DUPLICATE_WINDOW_MS = 8000;
 
@@ -27,23 +28,37 @@ function isDuplicate(key) {
 }
 
 // POST /api/points
-// Body: { member_id, points, reason, category, teacher_name, remarks }
+// Body: { member_id, reason (= activity name), teacher_name, remarks }
+//
+// IMPORTANT: points are NEVER taken from the request body. The client
+// sends the activity name in "reason"; the server looks it up in
+// src/activities.js and uses THAT points value and category. This is
+// what makes points impossible to tamper with, whether the request
+// comes from the Excel macro, a bug in it, or someone hitting the API
+// directly with a tool like Postman.
 router.post('/', requireExcelApiKey, async (req, res) => {
   try {
-    const { member_id, points, reason, category, teacher_name, remarks } = req.body || {};
+    const { member_id, reason, activity, teacher_name, remarks } = req.body || {};
 
     if (!member_id || typeof member_id !== 'string') {
       return res.status(400).json({ error: 'member_id is required.' });
-    }
-    const pointsNum = Number(points);
-    if (!Number.isFinite(pointsNum) || pointsNum === 0 || !Number.isInteger(pointsNum)) {
-      return res.status(400).json({ error: 'points must be a non-zero whole number.' });
     }
     if (!teacher_name || typeof teacher_name !== 'string') {
       return res.status(400).json({ error: 'teacher_name is required.' });
     }
 
-    const dupKey = `${member_id}|${pointsNum}|${reason || ''}|${teacher_name}`;
+    // Accept either "activity" or "reason" as the activity name so the
+    // existing Excel field name keeps working without a Config change.
+    const activityName = activity || reason;
+    const matched = findActivity(activityName);
+    if (!matched) {
+      return res.status(400).json({
+        error: `"${activityName || ''}" is not a recognised activity. Pick one from the fixed list (see GET /api/activities).`,
+      });
+    }
+    const pointsNum = matched.points;
+
+    const dupKey = `${member_id}|${matched.name}|${teacher_name}`;
     if (isDuplicate(dupKey)) {
       return res.status(409).json({
         error: 'Duplicate submission detected. This exact entry was just submitted a few seconds ago.',
@@ -67,8 +82,8 @@ router.post('/', requireExcelApiKey, async (req, res) => {
         student_id: student.id,
         member_id: student.member_id,
         points: pointsNum,
-        reason: reason || null,
-        category: category || null,
+        reason: matched.name,
+        category: matched.category,
         teacher_name,
         remarks: remarks || null,
       })
@@ -90,6 +105,7 @@ router.post('/', requireExcelApiKey, async (req, res) => {
       success: true,
       student: student.name,
       member_id: student.member_id,
+      activity: matched.name,
       points_added: pointsNum,
       new_total: updated ? updated.current_points : student.current_points + pointsNum,
       transaction_id: txn.id,
@@ -105,11 +121,7 @@ router.get('/history', async (req, res) => {
   const { member_id, limit } = req.query;
   let query = supabase
     .from('points_transactions')
-    // Embed the linked student row via the student_id foreign key so the
-    // response includes the student's name/class/room/house, not just
-    // their member_id. Without this join, history rows have no student
-    // info attached at all.
-    .select('*, students(name, class, room, house)')
+    .select('*')
     .order('created_at', { ascending: false })
     .limit(Math.min(Number(limit) || 100, 500));
 
@@ -117,21 +129,7 @@ router.get('/history', async (req, res) => {
 
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
-
-  // Flatten the embedded "students" object onto each transaction so the
-  // frontend doesn't need to know about the join shape.
-  const transactions = (data || []).map((row) => {
-    const { students: student, ...txn } = row;
-    return {
-      ...txn,
-      student_name: student ? student.name : null,
-      class: student ? student.class : null,
-      room: student ? student.room : null,
-      house: student ? student.house : null,
-    };
-  });
-
-  return res.json({ transactions });
+  return res.json({ transactions: data });
 });
 
 module.exports = router;
