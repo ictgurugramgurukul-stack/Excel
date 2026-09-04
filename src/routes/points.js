@@ -1,135 +1,147 @@
 const express = require('express');
 const supabase = require('../supabaseClient');
 const { requireExcelApiKey } = require('../middleware/auth');
-const { findActivity } = require('../activities');
 
 const router = express.Router();
 
-// A simple in-memory guard against accidental double-submits from a
-// double-click: if the exact same (member_id, activity, teacher) arrives
-// again within a few seconds, it's rejected as a duplicate. This is a
-// best-effort safety net on top of the Excel-side button lock (see the
-// VBA code) — it does not replace it.
-const recentSubmissions = new Map(); // key -> timestamp (ms)
-const DUPLICATE_WINDOW_MS = 8000;
+const HOUSES = ['Samveda', 'Yajurveda', 'Atharvaveda', 'Rugveda'];
+const HOUSES_LOWER = new Map(HOUSES.map((h) => [h.toLowerCase(), h]));
 
-function isDuplicate(key) {
-  const now = Date.now();
-  const last = recentSubmissions.get(key);
-  // Clean up old entries occasionally
-  if (recentSubmissions.size > 500) {
-    for (const [k, t] of recentSubmissions) {
-      if (now - t > DUPLICATE_WINDOW_MS) recentSubmissions.delete(k);
-    }
-  }
-  if (last && now - last < DUPLICATE_WINDOW_MS) return true;
-  recentSubmissions.set(key, now);
-  return false;
+// Matches a house name loosely (trims + case-insensitive) so a stray
+// space or "yajurveda" typed in lowercase doesn't fail the whole import.
+function normalizeHouse(house) {
+  if (!house || typeof house !== 'string') return null;
+  return HOUSES_LOWER.get(house.trim().toLowerCase()) || null;
 }
 
-// POST /api/points
-// Body: { member_id, reason (= activity name), teacher_name, remarks }
-//
-// IMPORTANT: points are NEVER taken from the request body. The client
-// sends the activity name in "reason"; the server looks it up in
-// src/activities.js and uses THAT points value and category. This is
-// what makes points impossible to tamper with, whether the request
-// comes from the Excel macro, a bug in it, or someone hitting the API
-// directly with a tool like Postman.
+// GET /api/students
+// Used by Excel's "SYNC STUDENTS" button AND the website's Students page.
+// Protected with the same Excel API key so the full roster (with current
+// points) isn't scrapeable by anyone who finds the URL; the website's
+// own frontend calls this through its own backend, not directly.
+router.get('/', requireExcelApiKey, async (req, res) => {
+  const { data, error } = await supabase
+    .from('students')
+    .select('member_id, name, class, room, house, current_points')
+    .order('name', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ students: data });
+});
+
+// POST /api/students
+// Body: { member_id, name, class, room, house }
+// Used by the website's "Add Student" page / the ADD STUDENT sheet.
 router.post('/', requireExcelApiKey, async (req, res) => {
-  try {
-    const { member_id, reason, activity, teacher_name, remarks } = req.body || {};
+  const { member_id, name, class: className, room, house } = req.body || {};
 
-    if (!member_id || typeof member_id !== 'string') {
-      return res.status(400).json({ error: 'member_id is required.' });
-    }
-    if (!teacher_name || typeof teacher_name !== 'string') {
-      return res.status(400).json({ error: 'teacher_name is required.' });
-    }
+  if (!member_id || !name || !house) {
+    return res.status(400).json({ error: 'member_id, name and house are required.' });
+  }
+  const normalizedHouse = normalizeHouse(house);
+  if (!normalizedHouse) {
+    return res.status(400).json({ error: `house must be one of: ${HOUSES.join(', ')}` });
+  }
 
-    // Accept either "activity" or "reason" as the activity name so the
-    // existing Excel field name keeps working without a Config change.
-    const activityName = activity || reason;
-    const matched = findActivity(activityName);
-    if (!matched) {
-      return res.status(400).json({
-        error: `"${activityName || ''}" is not a recognised activity. Pick one from the fixed list (see GET /api/activities).`,
+  const { data, error } = await supabase
+    .from('students')
+    .insert({
+      member_id: String(member_id).trim(),
+      name: String(name).trim(),
+      class: className ? String(className).trim() : null,
+      room: room ? String(room).trim() : null,
+      house: normalizedHouse,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    const status = error.code === '23505' ? 409 : 500; // unique violation on member_id
+    return res.status(status).json({ error: error.message });
+  }
+  return res.status(201).json({ success: true, student: data });
+});
+
+// POST /api/students/bulk
+// Body: { students: [ { member_id, name, class, room, house }, ... ] }
+//
+// Built for importing the student_import_template spreadsheet in one go.
+// Unlike POST /api/students, a bad row (missing field, invalid house, a
+// stray header row accidentally pasted into the middle of the data,
+// etc.) is SKIPPED and reported — it does not abort the rest of the
+// batch. Duplicate member_ids (already in the database) are reported
+// separately, not treated as a hard failure.
+router.post('/bulk', requireExcelApiKey, async (req, res) => {
+  const { students } = req.body || {};
+
+  if (!Array.isArray(students) || students.length === 0) {
+    return res.status(400).json({ error: '"students" must be a non-empty array.' });
+  }
+  if (students.length > 500) {
+    return res.status(400).json({ error: 'Max 500 students per bulk import.' });
+  }
+
+  const inserted = [];
+  const skipped = []; // bad/invalid rows — never sent to the database
+  const duplicates = []; // valid rows that already exist (member_id conflict)
+  const failed = []; // valid rows that hit an unexpected DB error
+
+  for (let i = 0; i < students.length; i++) {
+    const row = students[i] || {};
+    const rowNum = i + 1;
+    const member_id = row.member_id != null ? String(row.member_id).trim() : '';
+    const name = row.name != null ? String(row.name).trim() : '';
+    const className = row.class != null ? String(row.class).trim() : '';
+    const room = row.room != null ? String(row.room).trim() : '';
+    const houseRaw = row.house != null ? String(row.house).trim() : '';
+    const house = normalizeHouse(houseRaw);
+
+    // Catches stray header rows like {member_id:"Member ID", house:"Phone Number"}
+    // as well as ordinary missing-field rows.
+    if (!member_id || !name || !houseRaw) {
+      skipped.push({ row: rowNum, member_id: member_id || null, reason: 'Missing member_id, name, or house.' });
+      continue;
+    }
+    if (!house) {
+      skipped.push({
+        row: rowNum,
+        member_id,
+        reason: `"${houseRaw}" is not a valid house (must be one of: ${HOUSES.join(', ')}).`,
       });
-    }
-    const pointsNum = matched.points;
-
-    const dupKey = `${member_id}|${matched.name}|${teacher_name}`;
-    if (isDuplicate(dupKey)) {
-      return res.status(409).json({
-        error: 'Duplicate submission detected. This exact entry was just submitted a few seconds ago.',
-      });
+      continue;
     }
 
-    // Look up the student to (a) confirm they exist and (b) get their id/name.
-    const { data: student, error: studentErr } = await supabase
+    const { data, error } = await supabase
       .from('students')
-      .select('id, member_id, name, current_points')
-      .eq('member_id', member_id)
-      .single();
-
-    if (studentErr || !student) {
-      return res.status(404).json({ error: `No student found with member_id "${member_id}".` });
-    }
-
-    const { data: txn, error: txnErr } = await supabase
-      .from('points_transactions')
-      .insert({
-        student_id: student.id,
-        member_id: student.member_id,
-        points: pointsNum,
-        reason: matched.name,
-        category: matched.category,
-        teacher_name,
-        remarks: remarks || null,
-      })
+      .insert({ member_id, name, class: className || null, room: room || null, house })
       .select()
       .single();
 
-    if (txnErr) {
-      return res.status(500).json({ error: 'Failed to record transaction.', details: txnErr.message });
+    if (error) {
+      if (error.code === '23505') {
+        duplicates.push({ row: rowNum, member_id, reason: 'Member ID already exists.' });
+      } else {
+        failed.push({ row: rowNum, member_id, reason: error.message });
+      }
+      continue;
     }
-
-    // current_points is updated by a DB trigger; re-read it to return the true new total.
-    const { data: updated } = await supabase
-      .from('students')
-      .select('current_points')
-      .eq('id', student.id)
-      .single();
-
-    return res.status(201).json({
-      success: true,
-      student: student.name,
-      member_id: student.member_id,
-      activity: matched.name,
-      points_added: pointsNum,
-      new_total: updated ? updated.current_points : student.current_points + pointsNum,
-      transaction_id: txn.id,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: 'Unexpected server error.', details: err.message });
+    inserted.push({ row: rowNum, member_id, name });
   }
-});
 
-// GET /api/points/history?member_id=G001&limit=50
-// Public read (used by the website's Points History page).
-router.get('/history', async (req, res) => {
-  const { member_id, limit } = req.query;
-  let query = supabase
-    .from('points_transactions')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(Math.min(Number(limit) || 100, 500));
-
-  if (member_id) query = query.eq('member_id', member_id);
-
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
-  return res.json({ transactions: data });
+  return res.status(200).json({
+    success: true,
+    summary: {
+      total: students.length,
+      inserted: inserted.length,
+      skipped: skipped.length,
+      duplicates: duplicates.length,
+      failed: failed.length,
+    },
+    inserted,
+    skipped,
+    duplicates,
+    failed,
+  });
 });
 
 module.exports = router;
